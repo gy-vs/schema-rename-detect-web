@@ -1,20 +1,39 @@
 import express from 'express';
+import {existsSync} from 'node:fs';
+import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {createApp} from './routes';
+import {AnalyzerService} from './analyzer';
+import {Store, defaultDBPath} from './store';
+import {seedIfEmpty} from './seed';
 
-type RecordRow = {id:string;name:string;revision:number;content:string;updatedAt:string};
-const rows: RecordRow[] = [
-  {id:'alpha',name:'Primary schema revisions',revision:3,content:'schema revisions: alpha\nstate: active',updatedAt:new Date(0).toISOString()},
-  {id:'beta',name:'Secondary schema revisions',revision:5,content:'schema revisions: beta\nstate: review',updatedAt:new Date(1000).toISOString()},
-];
+const PORT = Number(process.env.PORT ?? 4174);
+const HOST = process.env.HOST ?? '127.0.0.1';
 
-export function createApp(){
-  const app=express();
-  app.use(express.json({limit:'1mb'}));
-  app.get('/api/bootstrap',(_req,res)=>res.json({family:"schema-evolution",count:rows.length}));
-  app.get('/api/schemas',(_req,res)=>res.json(rows.map(({content,...row})=>row)));
-  app.get('/api/schemas/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});res.set('ETag',String(row.revision)).json(row)});
-  app.put('/api/schemas/:id',(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});if(req.body.revision!==row.revision)return res.status(409).json({error:'revision_conflict',current:row});row.content=String(req.body.content??'');row.revision+=1;row.updatedAt=new Date().toISOString();res.json(row)});
-  app.post('/api/schemas/:id/analyze',async(req,res)=>{const row=rows.find(value=>value.id===req.params.id);if(!row)return res.status(404).json({error:'not_found'});await new Promise(resolve=>setTimeout(resolve,req.params.id==='alpha'?100:20));res.json({id:row.id,revision:row.revision,lines:String(req.body.content??row.content).split(/\r?\n/).length,diagnostics:[]})});
-  return app;
+export function buildServer(dbFile?: string) {
+  const file = dbFile ?? process.env.STUDIO_DB ?? defaultDBPath();
+  const store = new Store(file);
+  seedIfEmpty(store);
+  const analyzer = new AnalyzerService(store);
+  const app = createApp({store, analyzer});
+
+  // 生产环境把 vite build 的产物直接挂出来（相对本文件定位，与启动目录无关）
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const publicDir = path.resolve(here, '..', 'client');
+  if (existsSync(publicDir)) {
+    app.use(express.static(publicDir));
+    app.get(/^(?!\/api\/).*/, (_req, res) => {
+      res.sendFile(path.join(publicDir, 'index.html'));
+    });
+  }
+  return {app, store};
 }
-if(process.argv[1]===fileURLToPath(import.meta.url)){createApp().listen(4174,'127.0.0.1',()=>console.log('server http://127.0.0.1:4174'))}
+
+// 同时兼容 tsx 直跑（src/server/index.ts）和 ESM 产物（dist/server/index.mjs）
+const entry = process.argv[1]?.replace(/\\/g, '/') ?? '';
+if (entry.endsWith('src/server/index.ts') || entry.endsWith('dist/server/index.mjs')) {
+  const {app} = buildServer();
+  app.listen(PORT, HOST, () => {
+    console.log(`Schema Evolution Studio: http://${HOST}:${PORT}`);
+  });
+}
